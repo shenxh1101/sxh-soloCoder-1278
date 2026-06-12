@@ -12,3 +12,4 @@ matplotlib>=3.7.0
 mediapipe>=0.10.0
 rembg>=2.0.50
 tqdm>=4.66.0
+streamlit-sortables>=0.3.0

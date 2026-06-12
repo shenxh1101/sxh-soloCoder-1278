@@ -133,17 +133,85 @@ class RenameContext:
     height: int = 0
 
 
-def _parse_gps(gps_data: str) -> Optional[Tuple[float, float]]:
-    """从EXIF的GPS数据解析经纬度"""
+def _parse_gps_from_exif(exif: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """从EXIF GPS IFD直接解析经纬度（度分秒格式）"""
     try:
-        data_dict = json.loads(gps_data) if isinstance(gps_data, str) else gps_data
-        lat = data_dict.get("Latitude") or data_dict.get("latitude")
-        lon = data_dict.get("Longitude") or data_dict.get("longitude")
+        lat_val = exif.get("GPS.GPSLatitude")
+        lat_ref = exif.get("GPS.GPSLatitudeRef")
+        lon_val = exif.get("GPS.GPSLongitude")
+        lon_ref = exif.get("GPS.GPSLongitudeRef")
+        
+        if lat_val is None or lon_val is None:
+            return None
+        
+        def dms_to_decimal(dms, ref):
+            if isinstance(dms, (tuple, list)) and len(dms) == 3:
+                d, m, s = dms
+                if isinstance(d, tuple) and len(d) == 2:
+                    d = d[0] / d[1] if d[1] else 0
+                if isinstance(m, tuple) and len(m) == 2:
+                    m = m[0] / m[1] if m[1] else 0
+                if isinstance(s, tuple) and len(s) == 2:
+                    s = s[0] / s[1] if s[1] else 0
+                decimal = float(d) + float(m) / 60.0 + float(s) / 3600.0
+                if isinstance(ref, bytes):
+                    ref = ref.decode("utf-8", errors="ignore")
+                if str(ref).upper() in ("S", "W"):
+                    decimal = -decimal
+                return decimal
+            elif isinstance(dms, (int, float)):
+                return float(dms)
+            return None
+        
+        lat = dms_to_decimal(lat_val, lat_ref)
+        lon = dms_to_decimal(lon_val, lon_ref)
         if lat is not None and lon is not None:
-            return (float(lat), float(lon))
+            return (lat, lon)
     except Exception:
         pass
     return None
+
+
+def _format_gps_dms(lat: float, lon: float) -> str:
+    """将十进制经纬度转换为度分秒可读格式"""
+    def to_dms(decimal, is_lat):
+        direction = ("N" if is_lat else "E") if decimal >= 0 else ("S" if is_lat else "W")
+        decimal = abs(decimal)
+        d = int(decimal)
+        m = int((decimal - d) * 60)
+        s = (decimal - d - m / 60.0) * 3600.0
+        return f"{d}{direction}{m:02d}{s:02.0f}"
+    return f"{to_dms(lat, True)}_{to_dms(lon, False)}"
+
+
+def _reverse_geocode_simple(lat: float, lon: float) -> str:
+    """简易逆地理编码：返回纬度带+经度带作为可读位置片段（无需网络）"""
+    def lat_zone(lat_v):
+        if lat_v > 66.5: return "Arctic"
+        elif lat_v > 55: return "North"
+        elif lat_v > 45: return "NMid"
+        elif lat_v > 35: return "Mediter"
+        elif lat_v > 23.5: return "SubTrop"
+        elif lat_v > 10: return "Tropic"
+        elif lat_v > -10: return "Equator"
+        elif lat_v > -23.5: return "STropic"
+        elif lat_v > -35: return "SSubTrop"
+        elif lat_v > -55: return "SMid"
+        else: return "Antarc"
+    
+    def lon_zone(lon_v):
+        if lon_v > 150: return "WPac"
+        elif lon_v > 120: return "EAsia"
+        elif lon_v > 90: return "SAsia"
+        elif lon_v > 60: return "Mideast"
+        elif lon_v > 30: return "EAfrica"
+        elif lon_v > 0: return "WEurope"
+        elif lon_v > -30: return "WAtlantic"
+        elif lon_v > -60: return "SAmerica"
+        elif lon_v > -90: return "CAmerica"
+        else: return "Pacific"
+    
+    return f"{lat_zone(lat)}_{lon_zone(lon)}"
 
 
 def _get_camera_model(exif: Dict[str, Any]) -> str:
@@ -265,8 +333,22 @@ def generate_new_name(
         minute = mtime.strftime("%M")
         second = mtime.strftime("%S")
     
-    camera = _get_camera_model(context.exif) or "UnknownCamera"
-    lens = _get_lens_model(context.exif) or "UnknownLens"
+    camera = _get_camera_model(context.exif) or "NoCamera"
+    lens = _get_lens_model(context.exif) or "NoLens"
+    
+    gps = _parse_gps_from_exif(context.exif)
+    if gps:
+        gps_lat = f"{gps[0]:.4f}"
+        gps_lon = f"{gps[1]:.4f}"
+        gps_dms = _format_gps_dms(gps[0], gps[1])
+        location = _reverse_geocode_simple(gps[0], gps[1])
+        gps_short = f"{abs(gps[0]):.0f}{('N' if gps[0]>=0 else 'S')}{abs(gps[1]):.0f}{('E' if gps[1]>=0 else 'W')}"
+    else:
+        gps_lat = "NoGPS"
+        gps_lon = "NoGPS"
+        gps_dms = "NoGPS"
+        location = "NoLoc"
+        gps_short = "NoGPS"
     
     focal = context.exif.get("Exif.FocalLength") or context.exif.get("FocalLength") or ""
     aperture = context.exif.get("Exif.FNumber") or context.exif.get("FNumber") or ""
@@ -277,11 +359,15 @@ def generate_new_name(
         focal = f"{focal[0] / focal[1]:.0f}mm" if focal[1] else ""
     elif focal:
         focal = f"{focal}mm"
+    else:
+        focal = "NoFL"
     
     if isinstance(aperture, tuple) and len(aperture) == 2:
         aperture = f"f{aperture[0] / aperture[1]:.1f}" if aperture[1] else ""
     elif aperture:
         aperture = f"f{aperture}"
+    else:
+        aperture = "NoF"
     
     if isinstance(shutter, tuple) and len(shutter) == 2:
         if shutter[1] and shutter[0] < shutter[1]:
@@ -292,6 +378,11 @@ def generate_new_name(
             shutter = ""
     elif shutter:
         shutter = f"{shutter}s"
+    else:
+        shutter = "NoSS"
+    
+    if not iso:
+        iso = "NoISO"
     
     try:
         result = template.format(
@@ -320,6 +411,11 @@ def generate_new_name(
             aperture=str(aperture),
             shutter=str(shutter),
             iso=str(iso),
+            gps_lat=gps_lat,
+            gps_lon=gps_lon,
+            gps_dms=gps_dms,
+            location=location,
+            gps_short=gps_short,
         )
     except (KeyError, IndexError, ValueError):
         result = f"{context.original_stem}_{context.index:04d}"

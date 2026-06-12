@@ -12,10 +12,19 @@ from dataclasses import dataclass, field
 import numpy as np
 from PIL import Image, ImageOps, ExifTags, TiffImagePlugin
 from PIL.ExifTags import TAGS, GPSTAGS
-import piexif
-import pillow_heif
 
-pillow_heif.register_heif_opener()
+try:
+    import piexif
+    _HAS_PIEXIF = True
+except ImportError:
+    _HAS_PIEXIF = False
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    _HAS_HEIF = True
+except ImportError:
+    _HAS_HEIF = False
 
 SUPPORTED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif",
@@ -74,6 +83,8 @@ def load_image(filepath: Union[str, Path]) -> Image.Image:
 def _decode_exif_bytes(exif_bytes: bytes) -> Dict[str, Any]:
     """解码EXIF字节数据"""
     result = {}
+    if not _HAS_PIEXIF:
+        return result
     try:
         exif_dict = piexif.load(exif_bytes)
         for ifd in ("0th", "Exif", "GPS", "1st"):
@@ -110,6 +121,8 @@ def read_exif(image: Union[Image.Image, str, Path]) -> Dict[str, Any]:
 
 def write_exif(image: Image.Image, exif_data: Dict[str, Any]) -> Image.Image:
     """写入EXIF信息到图像"""
+    if not _HAS_PIEXIF:
+        return image
     try:
         exif_bytes = image.info.get("exif")
         if exif_bytes:
