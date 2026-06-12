@@ -131,6 +131,9 @@ class PipelineResult:
     processing_time: float = 0.0
     step_results: List[Dict[str, Any]] = field(default_factory=list)
 
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 @register_step("crop_smart", "智能裁剪", "基于人脸/主体/三分法的自动构图裁剪", {
     "mode": "rule_of_thirds",
@@ -488,53 +491,79 @@ def _process_single_image(args_tuple):
     """多进程工作函数：处理单张图片（顶层函数可被pickle）"""
     (
         source_path, output_dir, pipeline_dict, rename_map_entry,
-        idx, total,
+        idx, total, input_root_dir,
     ) = args_tuple
-    
+
     start = time.time()
     result = PipelineResult(source_path=source_path)
-    
+
     try:
         pipeline = Pipeline.from_dict(pipeline_dict)
         image = load_image(source_path)
-        
+
         processed, step_results = execute_pipeline(image, pipeline)
-        
+
         new_filename = rename_map_entry if rename_map_entry else Path(source_path).name
-        
+
         format_hint = getattr(processed, "_format_hint", None)
         save_kwargs = getattr(processed, "_save_kwargs", {})
-        
+
         if format_hint:
             from .format_rename import get_format_extension
             ext = get_format_extension(format_hint)
-            new_filename = Path(new_filename).with_suffix(ext)
-        
-        output_path = Path(output_dir) / new_filename
+            new_filename = str(Path(new_filename).with_suffix(ext))
+
+        if input_root_dir:
+            try:
+                rel = Path(source_path).relative_to(Path(input_root_dir))
+                rel_parent = rel.parent
+                if str(rel_parent) != ".":
+                    sub_out = Path(output_dir) / rel_parent
+                    sub_out.mkdir(parents=True, exist_ok=True)
+                    output_path = sub_out / new_filename
+                else:
+                    output_path = Path(output_dir) / new_filename
+            except ValueError:
+                output_path = Path(output_dir) / new_filename
+        else:
+            output_path = Path(output_dir) / new_filename
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
+        if output_path.exists():
+            stem = output_path.stem
+            suffix = output_path.suffix
+            counter = 1
+            while True:
+                candidate = output_path.with_name(f"{stem}_{counter:03d}{suffix}")
+                if not candidate.exists():
+                    output_path = candidate
+                    new_filename = output_path.name
+                    break
+                counter += 1
+
         save_kwargs_final = {
             "quality": save_kwargs.get("quality", 95),
             "optimize": save_kwargs.get("optimize", True),
             "keep_exif": save_kwargs.get("keep_exif", True),
             "format": save_kwargs.get("format"),
         }
-        
+
         save_image(processed, str(output_path), **save_kwargs_final)
-        
+
         result.output_path = str(output_path)
-        result.new_filename = new_filename
+        result.new_filename = str(Path(output_path).relative_to(output_dir)) if output_path.is_relative_to(output_dir) else output_path.name
         result.step_results = [
             {k: v for k, v in sr.items() if k != "image"}
             for sr in step_results
         ]
         result.processing_time = time.time() - start
-        
+
     except Exception as e:
         result.success = False
         result.error_message = str(e) + "\n" + traceback.format_exc()
         result.processing_time = time.time() - start
-    
+
     return idx, result
 
 
@@ -546,9 +575,10 @@ def batch_execute_pipeline(
     num_workers: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int, PipelineResult], None]] = None,
     start_index: int = 1,
+    input_root_dir: Optional[str] = None,
 ) -> List[PipelineResult]:
     """批量多进程执行流水线
-    
+
     Args:
         source_paths: 源图片路径列表
         output_dir: 输出目录
@@ -557,35 +587,36 @@ def batch_execute_pipeline(
         num_workers: 进程数，None=CPU核心数
         progress_callback: 回调(完成数量, 总数, 最新结果)
         start_index: 重命名起始序号
-    
+        input_root_dir: 源根目录，用于在输出中保留原目录层级
+
     Returns:
         处理结果列表（按输入顺序）
     """
     output_dir = str(output_dir)
     os.makedirs(output_dir, exist_ok=True)
-    
+
     total = len(source_paths)
-    
+
     if rename_template:
         rename_map = batch_rename(source_paths, rename_template, start_index)
         rename_entries = [rename_map[p] for p in source_paths]
     else:
         rename_entries = [Path(p).name for p in source_paths]
-    
+
     pipeline_dict = pipeline.to_dict()
-    
+
     args_list = [
-        (source_paths[i], output_dir, pipeline_dict, rename_entries[i], i, total)
+        (source_paths[i], output_dir, pipeline_dict, rename_entries[i], i, total, input_root_dir)
         for i in range(total)
     ]
-    
+
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() - 1)
     num_workers = min(max(1, num_workers), total)
-    
+
     results = [None] * total
     completed = 0
-    
+
     if num_workers == 1 or total <= 2:
         for args in args_list:
             idx, res = _process_single_image(args)
@@ -597,14 +628,14 @@ def batch_execute_pipeline(
                 except Exception:
                     pass
         return results
-    
+
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
         future_map = {
             executor.submit(_process_single_image, args): args[4]
             for args in args_list
         }
-        
+
         for future in as_completed(future_map):
             idx, res = future.result()
             results[idx] = res
@@ -614,7 +645,7 @@ def batch_execute_pipeline(
                     progress_callback(completed, total, res)
                 except Exception:
                     pass
-    
+
     return results
 
 

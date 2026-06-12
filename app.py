@@ -7,7 +7,8 @@
 - 实时原图 vs 处理后对比预览
 - 预设管理
 - 多进程并行处理 + 进度显示
-- 打包下载
+- 任务历史记录、筛选排序、失败项重试
+- CSV/JSON 报告导出
 """
 
 import os
@@ -15,8 +16,11 @@ import io
 import sys
 import time
 import json
+import csv
 import tempfile
+import uuid
 from pathlib import Path
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
@@ -120,6 +124,15 @@ st.markdown("""
     .tag-output { background: #00695C; color: white; }
     .big-number { font-size: 1.8rem; font-weight: bold; text-align: center; }
     .metric-label { font-size: 0.85rem; opacity: 0.7; text-align: center; }
+    .history-card {
+        border: 1px solid #333;
+        border-radius: 8px;
+        padding: 0.8rem;
+        margin: 0.4rem 0;
+        background: #111;
+        cursor: pointer;
+    }
+    .history-card:hover { border-color: #666; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -141,8 +154,113 @@ def _get_step_info(step_type: str) -> Dict[str, Any]:
     })
 
 
+def _result_to_dict(r: Any) -> Dict[str, Any]:
+    if hasattr(r, "to_dict"):
+        return r.to_dict()
+    return {
+        "source_path": getattr(r, "source_path", ""),
+        "output_path": getattr(r, "output_path", None),
+        "new_filename": getattr(r, "new_filename", None),
+        "success": getattr(r, "success", True),
+        "error_message": getattr(r, "error_message", ""),
+        "processing_time": getattr(r, "processing_time", 0.0),
+    }
+
+
+def _dict_to_result(d: Dict[str, Any]) -> PipelineResult:
+    return PipelineResult(
+        source_path=d.get("source_path", ""),
+        output_path=d.get("output_path"),
+        new_filename=d.get("new_filename"),
+        success=d.get("success", True),
+        error_message=d.get("error_message", ""),
+        processing_time=d.get("processing_time", 0.0),
+        step_results=d.get("step_results", []),
+    )
+
+
+def _save_task_history(task: Dict[str, Any]):
+    """保存任务到历史记录（持久化到本地 JSON）"""
+    max_history = 20
+    history_file = Path(tempfile.gettempdir()) / "img_batch_history.json"
+    history = []
+    if history_file.exists():
+        try:
+            history = json.loads(history_file.read_text(encoding="utf-8"))
+        except Exception:
+            history = []
+    history.insert(0, task)
+    if len(history) > max_history:
+        history = history[:max_history]
+    try:
+        history_file.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    st.session_state.task_history = history
+
+
+def _load_task_history() -> List[Dict[str, Any]]:
+    if "task_history" in st.session_state:
+        return st.session_state.task_history
+    history_file = Path(tempfile.gettempdir()) / "img_batch_history.json"
+    if history_file.exists():
+        try:
+            history = json.loads(history_file.read_text(encoding="utf-8"))
+            st.session_state.task_history = history
+            return history
+        except Exception:
+            pass
+    st.session_state.task_history = []
+    return []
+
+
+def _build_task_report_json(task: Dict[str, Any]) -> str:
+    report = {
+        "task_id": task.get("task_id"),
+        "created_at": task.get("created_at"),
+        "input_dir": task.get("input_dir"),
+        "output_dir": task.get("output_dir"),
+        "stats": task.get("stats", {}),
+        "pipeline": task.get("pipeline", {}),
+        "rename_template": task.get("rename_template"),
+        "num_workers": task.get("num_workers"),
+        "results": task.get("results", []),
+    }
+    return json.dumps(report, ensure_ascii=False, indent=2)
+
+
+def _build_task_report_csv(task: Dict[str, Any]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "序号", "源文件", "输出文件", "是否成功", "错误信息", "处理耗时(秒)",
+    ])
+    for i, r in enumerate(task.get("results", []), 1):
+        writer.writerow([
+            i,
+            r.get("source_path", ""),
+            r.get("new_filename") or r.get("output_path", ""),
+            "成功" if r.get("success", True) else "失败",
+            r.get("error_message", "")[:200],
+            f"{r.get('processing_time', 0.0):.3f}",
+        ])
+    writer.writerow([])
+    writer.writerow(["--- 流水线步骤 ---"])
+    writer.writerow(["步骤号", "类型", "名称", "参数"])
+    for i, s in enumerate(task.get("pipeline", {}).get("steps", []), 1):
+        writer.writerow([i, s.get("step_type", ""), s.get("step_type", ""), json.dumps(s.get("params", {}), ensure_ascii=False)])
+    writer.writerow([])
+    writer.writerow(["--- 统计 ---"])
+    for k, v in task.get("stats", {}).items():
+        writer.writerow([k, v])
+    return output.getvalue()
+
+
+# ============================================================
+# 步骤参数渲染
+# ============================================================
+
 def _render_step_params(idx: int, step, defaults: Dict[str, Any]):
-    """渲染单个步骤的参数配置面板"""
     params = step.params
     t = step.step_type
     changed = False
@@ -377,20 +495,37 @@ def _render_step_params(idx: int, step, defaults: Dict[str, Any]):
         st.rerun()
 
 
-def _run_batch_processing_ui():
-    """执行批量处理并在主区域显示实时进度"""
-    if not st.session_state.pipeline or not st.session_state.image_paths:
+# ============================================================
+# 批量处理执行
+# ============================================================
+
+def _run_batch_processing_ui(source_paths_override=None, output_dir_override=None, is_retry=False):
+    """执行批量处理并在主区域显示实时进度
+
+    Args:
+        source_paths_override: 非None时覆盖默认路径列表（用于失败重试）
+        output_dir_override: 非None时覆盖输出目录（失败重试时复用原目录）
+        is_retry: 是否为重试任务
+    """
+    if not st.session_state.pipeline:
         st.session_state.processing = False
         return
 
-    output_dir = tempfile.mkdtemp(prefix="output_batch_")
+    source_paths = source_paths_override if source_paths_override is not None else st.session_state.image_paths
+    if not source_paths:
+        st.session_state.processing = False
+        return
+
+    output_dir = output_dir_override if output_dir_override else tempfile.mkdtemp(prefix="output_batch_")
     st.session_state.output_dir = output_dir
     st.session_state._zip_ready = False
     st.session_state._zip_path = None
 
-    total = len(st.session_state.image_paths)
+    total = len(source_paths)
 
     st.header("⏳ 正在批量处理...")
+    if is_retry:
+        st.info(f"本次为重试任务，共处理 {total} 张失败图片")
     progress_bar = st.progress(0.0)
     status_text = st.empty()
     status_text.info(f"准备处理 {total} 张图片...")
@@ -445,54 +580,194 @@ def _run_batch_processing_ui():
         )
 
     rename_template = st.session_state.rename_template if st.session_state.rename_enabled else None
+    input_root_dir = st.session_state.get("input_dir")
 
     try:
         results = batch_execute_pipeline(
-            source_paths=st.session_state.image_paths,
+            source_paths=source_paths,
             output_dir=output_dir,
             pipeline=st.session_state.pipeline,
             rename_template=rename_template,
             num_workers=st.session_state.num_workers,
             progress_callback=progress_cb,
+            input_root_dir=input_root_dir,
         )
     except Exception as e:
         st.error(f"批量处理异常: {e}")
         results = []
 
+    total_elapsed = time.time() - metrics["start"]
+    success_count = metrics["success"]
+    fail_count = metrics["fail"]
+
+    pipeline_dict = st.session_state.pipeline.to_dict() if st.session_state.pipeline else {}
+    results_serializable = [_result_to_dict(r) for r in results]
+    times_list = [r.processing_time for r in results if r.success and r.processing_time > 0]
+
+    task_record = {
+        "task_id": str(uuid.uuid4())[:8],
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "input_dir": input_root_dir,
+        "output_dir": output_dir,
+        "image_count": total,
+        "stats": {
+            "success": success_count,
+            "fail": fail_count,
+            "total_elapsed": round(total_elapsed, 3),
+            "avg_speed": round(total / max(0.1, total_elapsed), 2),
+            "avg_time": round(float(np.mean(times_list)), 3) if times_list else 0,
+            "min_time": round(float(np.min(times_list)), 3) if times_list else 0,
+            "max_time": round(float(np.max(times_list)), 3) if times_list else 0,
+            "total_processing_time": round(float(np.sum(times_list)), 3) if times_list else 0,
+        },
+        "pipeline": pipeline_dict,
+        "rename_template": rename_template,
+        "num_workers": st.session_state.num_workers,
+        "results": results_serializable,
+        "is_retry": is_retry,
+    }
+
+    _save_task_history(task_record)
+    st.session_state.current_task = task_record
     st.session_state.last_results = results
     st.session_state.processing = False
     st.session_state.processing_done = True
     st.session_state._results_dir = output_dir
-    st.session_state._results_start = metrics["start"]
+    st.session_state._results_start_fixed = metrics["start"]
+    st.session_state._results_total_elapsed = total_elapsed
     st.session_state._results_metrics = dict(metrics)
+    st.session_state._current_task_id = task_record["task_id"]
     st.session_state._zip_ready = False
     st.session_state._zip_path = None
     st.rerun()
 
 
+# ============================================================
+# 结果页展示
+# ============================================================
+
 def _show_results_ui():
-    """显示批量处理结果界面"""
-    results = st.session_state.last_results
-    metrics = st.session_state.get("_results_metrics", {})
-    start_time = st.session_state.get("_results_start", time.time())
-    output_dir = st.session_state.get("_results_dir", "")
+    """显示批量处理结果界面（带筛选、排序、重试、历史、导出）"""
+    task = st.session_state.get("current_task")
+    if task is None:
+        results = st.session_state.last_results
+        total_elapsed = st.session_state.get("_results_total_elapsed", 0.0)
+        output_dir = st.session_state.get("_results_dir", "")
+        start_time_fixed = st.session_state.get("_results_start_fixed", time.time())
+        metrics_fixed = st.session_state.get("_results_metrics", {})
+        success_count = metrics_fixed.get("success", sum(1 for r in results if r.success))
+        fail_count = metrics_fixed.get("fail", sum(1 for r in results if not r.success))
+    else:
+        results = [_dict_to_result(d) for d in task.get("results", [])]
+        stats = task.get("stats", {})
+        success_count = stats.get("success", 0)
+        fail_count = stats.get("fail", 0)
+        total_elapsed = stats.get("total_elapsed", 0.0)
+        output_dir = task.get("output_dir", "")
+        start_time_fixed = None
+
+    total_images = len(results)
+    # 固定的平均速度，刷新不变化
+    avg_speed_fixed = total_images / max(0.1, total_elapsed)
 
     st.header("✅ 处理完成")
-
-    total_elapsed = time.time() - start_time
-    success_count = metrics.get("success", sum(1 for r in results if r.success))
-    fail_count = metrics.get("fail", sum(1 for r in results if not r.success))
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("✅ 成功", f"{success_count} 张")
     c2.metric("❌ 失败", f"{fail_count} 张")
     c3.metric("⏱️ 总耗时", f"{total_elapsed:.1f} 秒")
-    c4.metric("🚀 平均速度", f"{len(results)/max(0.1, total_elapsed):.1f} 张/秒")
+    c4.metric("🚀 平均速度", f"{avg_speed_fixed:.1f} 张/秒")
 
     st.divider()
-    st.subheader("📦 下载结果")
 
-    col_zip, col_stats = st.columns([1, 1])
+    # --- 筛选和排序 ---
+    filter_col, sort_col, _ = st.columns([1, 1, 2])
+    with filter_col:
+        filter_val = st.selectbox(
+            "筛选",
+            ["全部", "仅成功", "仅失败"],
+            key=f"filter_{st.session_state.get('_current_task_id', 'cur')}",
+        )
+    with sort_col:
+        sort_val = st.selectbox(
+            "排序",
+            ["默认顺序", "按耗时升序", "按耗时降序", "按文件名"],
+            key=f"sort_{st.session_state.get('_current_task_id', 'cur')}",
+        )
+
+    filtered_results = list(results)
+    if filter_val == "仅成功":
+        filtered_results = [r for r in filtered_results if r.success]
+    elif filter_val == "仅失败":
+        filtered_results = [r for r in filtered_results if not r.success]
+
+    if sort_val == "按耗时升序":
+        filtered_results.sort(key=lambda r: r.processing_time)
+    elif sort_val == "按耗时降序":
+        filtered_results.sort(key=lambda r: r.processing_time, reverse=True)
+    elif sort_val == "按文件名":
+        filtered_results.sort(key=lambda r: Path(r.source_path).name.lower())
+
+    # --- 失败项重试选择 ---
+    failed_results = [r for r in results if not r.success]
+    if failed_results:
+        with st.expander(f"🔄 重试失败项 (共 {len(failed_results)} 张)", expanded=False):
+            selected_retry = []
+            for r in failed_results:
+                fname = Path(r.source_path).name
+                if st.checkbox(
+                    f"{fname} — {r.error_message[:60]}",
+                    key=f"retry_{r.source_path}",
+                ):
+                    selected_retry.append(r.source_path)
+            if st.button("🚀 重试选中项", type="primary", disabled=len(selected_retry) == 0):
+                st.session_state._retry_paths = selected_retry
+                st.session_state._retry_output_dir = output_dir
+                st.session_state.processing = True
+                st.session_state.processing_done = False
+                st.rerun()
+
+    st.divider()
+
+    # --- 处理结果列表 ---
+    st.subheader(f"📋 处理明细 ({len(filtered_results)}/{total_images})")
+    if filtered_results:
+        for r in filtered_results[:100]:
+            fname = Path(r.source_path).name
+            out_name = r.new_filename or (Path(r.output_path).name if r.output_path else "-")
+            status_icon = "✅" if r.success else "❌"
+            with st.container():
+                m1, m2, m3, m4 = st.columns([3, 3, 1, 2])
+                with m1:
+                    st.markdown(f"**{status_icon} {fname}**")
+                    if not r.success:
+                        st.caption(f"错误: {r.error_message[:120]}")
+                with m2:
+                    st.caption(f"输出: `{out_name}`")
+                with m3:
+                    st.caption(f"{r.processing_time:.2f}s")
+                with m4:
+                    if r.success and r.output_path and os.path.isfile(r.output_path):
+                        try:
+                            with open(r.output_path, "rb") as fh:
+                                st.download_button(
+                                    "⬇️ 单张", fh, file_name=out_name,
+                                    key=f"dl_{r.source_path}",
+                                    use_container_width=True,
+                                )
+                        except Exception:
+                            pass
+        if len(filtered_results) > 100:
+            st.caption(f"... 还有 {len(filtered_results)-100} 条未显示")
+    else:
+        st.caption("没有符合筛选条件的结果")
+
+    st.divider()
+
+    # --- ZIP 下载 + 报告导出 ---
+    st.subheader("📦 下载与导出")
+
+    col_zip, col_rep_json, col_rep_csv = st.columns([1, 1, 1])
 
     with col_zip:
         if output_dir and os.path.isdir(output_dir):
@@ -518,39 +793,97 @@ def _show_results_ui():
         else:
             st.warning("输出目录不存在")
 
-    with col_stats:
-        failed = [r for r in results if not r.success]
-        if failed:
-            with st.expander(f"❌ 失败项 ({len(failed)})", expanded=True):
-                for r in failed[:20]:
-                    st.markdown(f"- **{Path(r.source_path).name}**: {r.error_message[:200]}")
-                if len(failed) > 20:
-                    st.caption(f"... 还有 {len(failed)-20} 项")
-        else:
-            st.success("🎉 全部处理成功！")
+    current_task = st.session_state.get("current_task")
+    if current_task:
+        with col_rep_json:
+            json_data = _build_task_report_json(current_task)
+            st.download_button(
+                "📄 导出报告 (JSON)",
+                json_data,
+                file_name=f"task_{current_task['task_id']}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with col_rep_csv:
+            csv_data = _build_task_report_csv(current_task)
+            st.download_button(
+                "📊 导出报告 (CSV)",
+                csv_data,
+                file_name=f"task_{current_task['task_id']}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+    else:
+        with col_rep_json:
+            st.caption("报告不可用")
+        with col_rep_csv:
+            st.caption("报告不可用")
 
-        times = [r.processing_time for r in results if r.success and r.processing_time > 0]
-        if times:
-            wall_time = total_elapsed
-            st.markdown(f"""
-            📊 **耗时统计**:
-            - 平均: {np.mean(times):.2f} s/张
-            - 最快: {np.min(times):.2f} s
-            - 最慢: {np.max(times):.2f} s
-            - 累计处理: {sum(times):.1f} s (实际耗时: {wall_time:.1f} s)
-            - 并行加速比: {sum(times) / max(0.1, wall_time):.1f}×
-            """)
+    st.divider()
+
+    # --- 任务历史 ---
+    st.subheader("📜 任务历史")
+    history = _load_task_history()
+    if not history:
+        st.caption("暂无历史记录")
+    else:
+        selected_history = st.selectbox(
+            "选择历史任务查看详情",
+            ["（不选）"] + [f"[{h['task_id']}] {h['created_at']} — {h['image_count']}张 成功{h['stats']['success']}/失败{h['stats']['fail']}"
+                          for h in history],
+            key="history_select",
+        )
+        if selected_history and selected_history != "（不选）":
+            selected_id = selected_history[1:9]
+            hist_task = next((h for h in history if h["task_id"] == selected_id), None)
+            if hist_task:
+                with st.container():
+                    st.markdown(f"""
+                    **任务 {hist_task['task_id']}** · {hist_task['created_at']}
+                    - 图片数: {hist_task['image_count']} · 成功: {hist_task['stats']['success']} · 失败: {hist_task['stats']['fail']}
+                    - 总耗时: {hist_task['stats']['total_elapsed']:.1f}s · 速度: {hist_task['stats'].get('avg_speed', 0):.1f}/s
+                    - 输入: `{hist_task.get('input_dir', '')}`
+                    - 输出: `{hist_task.get('output_dir', '')}`
+                    """)
+                    hist_failed = [r for r in hist_task["results"] if not r.get("success", True)]
+                    if hist_failed:
+                        with st.expander(f"❌ 失败项 ({len(hist_failed)})", expanded=False):
+                            for r in hist_failed[:20]:
+                                st.markdown(f"- **{Path(r.get('source_path', '')).name}**: {r.get('error_message', '')[:150]}")
+                    times_list = [r.get("processing_time", 0) for r in hist_task["results"]
+                                  if r.get("success", True) and r.get("processing_time", 0) > 0]
+                    if times_list:
+                        st.caption(
+                            f"耗时统计: 平均 {np.mean(times_list):.2f}s · 最快 {np.min(times_list):.2f}s · "
+                            f"最慢 {np.max(times_list):.2f}s · 并行加速比 {sum(times_list)/max(0.1, hist_task['stats']['total_elapsed']):.1f}×"
+                        )
+                    h_json = _build_task_report_json(hist_task)
+                    h_csv = _build_task_report_csv(hist_task)
+                    cc1, cc2 = st.columns(2)
+                    cc1.download_button("📄 导出JSON", h_json,
+                                       file_name=f"task_{hist_task['task_id']}.json",
+                                       mime="application/json", use_container_width=True,
+                                       key=f"hdl_json_{hist_task['task_id']}")
+                    cc2.download_button("📊 导出CSV", h_csv,
+                                       file_name=f"task_{hist_task['task_id']}.csv",
+                                       mime="text/csv", use_container_width=True,
+                                       key=f"hdl_csv_{hist_task['task_id']}")
 
     st.divider()
     if st.button("🔄 开始新任务", use_container_width=True, type="secondary"):
         st.session_state.processing = False
         st.session_state.processing_done = False
         st.session_state.last_results = []
+        st.session_state.current_task = None
         st.session_state._zip_ready = False
         st.session_state._zip_path = None
         st.session_state._results_dir = None
-        st.session_state._results_start = None
+        st.session_state._results_start_fixed = None
+        st.session_state._results_total_elapsed = 0
         st.session_state._results_metrics = {}
+        st.session_state._current_task_id = None
+        st.session_state._retry_paths = None
+        st.session_state._retry_output_dir = None
         st.rerun()
 
 
@@ -576,8 +909,14 @@ SESSION_DEFAULTS = {
     "_zip_ready": False,
     "_zip_path": None,
     "_results_dir": None,
-    "_results_start": None,
+    "_results_start_fixed": None,
+    "_results_total_elapsed": 0.0,
     "_results_metrics": {},
+    "current_task": None,
+    "_current_task_id": None,
+    "task_history": None,
+    "_retry_paths": None,
+    "_retry_output_dir": None,
 }
 
 for key, value in SESSION_DEFAULTS.items():
@@ -708,10 +1047,19 @@ with st.sidebar:
 
 is_processing = st.session_state.processing
 is_done = st.session_state.processing_done
+retry_paths = st.session_state.get("_retry_paths")
+retry_output_dir = st.session_state.get("_retry_output_dir")
 
 # --- 正在处理: 显示进度页 ---
 if is_processing and not is_done:
-    _run_batch_processing_ui()
+    if retry_paths is not None:
+        _run_batch_processing_ui(
+            source_paths_override=retry_paths,
+            output_dir_override=retry_output_dir,
+            is_retry=True,
+        )
+    else:
+        _run_batch_processing_ui()
 
 # --- 处理完成: 显示结果页 ---
 elif is_done:
@@ -742,6 +1090,8 @@ else:
             | 🏷️ **批量重命名** | EXIF日期、GPS位置、相机型号、自定义模板 |
             | 🤖 **AI 辅助** | 自动去背景、智能锐化、老照片修复、7种风格 |
             | 🏗️ **流水线** | 拖拽排序、实时预览、多进程并行、预设保存 |
+            | 📜 **任务历史** | 最近20次任务记录、筛选排序、失败重试 |
+            | 📄 **报告导出** | CSV/JSON格式报告复盘 |
             """)
         else:
             with st.expander(f"📸 图片缩略图 ({len(st.session_state.image_paths)} 张)", expanded=True):
@@ -1130,6 +1480,8 @@ else:
             st.caption("⚠️ 请先加载图片")
         elif not has_steps:
             st.caption("⚠️ 请先添加处理步骤")
+        elif is_done_btn:
+            st.caption("ℹ️ 查看最近处理结果，点「开始新任务」重新处理")
 
         if st.button(
             "🚀 开始批量处理",
@@ -1139,4 +1491,6 @@ else:
         ):
             st.session_state.processing = True
             st.session_state.processing_done = False
+            st.session_state._retry_paths = None
+            st.session_state._retry_output_dir = None
             st.rerun()
