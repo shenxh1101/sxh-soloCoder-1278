@@ -179,8 +179,13 @@ def _dict_to_result(d: Dict[str, Any]) -> PipelineResult:
     )
 
 
-def _save_task_history(task: Dict[str, Any]):
-    """保存任务到历史记录（持久化到本地 JSON）"""
+def _save_task_history(task: Dict[str, Any], merge_into_task_id: Optional[str] = None):
+    """保存任务到历史记录（持久化到本地 JSON）
+
+    Args:
+        task: 要保存的任务记录
+        merge_into_task_id: 非None时将此任务结果合并到已存在的对应task_id记录中（失败重试场景）
+    """
     max_history = 20
     history_file = Path(tempfile.gettempdir()) / "img_batch_history.json"
     history = []
@@ -189,7 +194,65 @@ def _save_task_history(task: Dict[str, Any]):
             history = json.loads(history_file.read_text(encoding="utf-8"))
         except Exception:
             history = []
-    history.insert(0, task)
+
+    if merge_into_task_id:
+        found_idx = None
+        for idx, h in enumerate(history):
+            if h.get("task_id") == merge_into_task_id:
+                found_idx = idx
+                break
+        if found_idx is not None:
+            original = history[found_idx]
+            # 合并结果：以重试task的results覆盖/追加到original对应项
+            retry_results = task.get("results", [])
+            original_results = original.get("results", [])
+            retry_by_source = {r.get("source_path"): r for r in retry_results}
+            merged_results = []
+            success_change = 0
+            fail_change = 0
+            for orig_r in original_results:
+                sp = orig_r.get("source_path")
+                if sp in retry_by_source:
+                    new_r = retry_by_source[sp]
+                    merged_results.append(new_r)
+                    was_success = orig_r.get("success", True)
+                    is_success = new_r.get("success", True)
+                    if was_success and not is_success:
+                        success_change -= 1
+                        fail_change += 1
+                    elif not was_success and is_success:
+                        success_change += 1
+                        fail_change -= 1
+                else:
+                    merged_results.append(orig_r)
+            original["results"] = merged_results
+            stats = original.get("stats", {})
+            stats["success"] = stats.get("success", 0) + success_change
+            stats["fail"] = max(0, stats.get("fail", 0) + fail_change)
+            total_elapsed_old = stats.get("total_elapsed", 0)
+            retry_elapsed = task.get("stats", {}).get("total_elapsed", 0)
+            stats["total_elapsed"] = round(total_elapsed_old + retry_elapsed, 3)
+            total_images = original.get("image_count", len(merged_results))
+            stats["avg_speed"] = round(total_images / max(0.1, stats["total_elapsed"]), 2)
+            times_list = [r.get("processing_time", 0) for r in merged_results
+                          if r.get("success", True) and r.get("processing_time", 0) > 0]
+            stats["avg_time"] = round(float(np.mean(times_list)), 3) if times_list else 0
+            stats["min_time"] = round(float(np.min(times_list)), 3) if times_list else 0
+            stats["max_time"] = round(float(np.max(times_list)), 3) if times_list else 0
+            stats["total_processing_time"] = round(float(np.sum(times_list)), 3) if times_list else 0
+            original["stats"] = stats
+            # 同步保留zip_path
+            if task.get("zip_path"):
+                original["zip_path"] = task["zip_path"]
+            original["last_retry_at"] = task.get("created_at")
+            original["retry_count"] = original.get("retry_count", 0) + 1
+            history[found_idx] = original
+            task = original
+        else:
+            history.insert(0, task)
+    else:
+        history.insert(0, task)
+
     if len(history) > max_history:
         history = history[:max_history]
     try:
@@ -197,10 +260,11 @@ def _save_task_history(task: Dict[str, Any]):
     except Exception:
         pass
     st.session_state.task_history = history
+    return task
 
 
 def _load_task_history() -> List[Dict[str, Any]]:
-    if "task_history" in st.session_state:
+    if "task_history" in st.session_state and st.session_state.task_history is not None:
         return st.session_state.task_history
     history_file = Path(tempfile.gettempdir()) / "img_batch_history.json"
     if history_file.exists():
@@ -212,6 +276,56 @@ def _load_task_history() -> List[Dict[str, Any]]:
             pass
     st.session_state.task_history = []
     return []
+
+
+def _update_task_history_entry(task_id: str, updates: Dict[str, Any]):
+    """更新某个已存在历史任务的字段"""
+    history_file = Path(tempfile.gettempdir()) / "img_batch_history.json"
+    history = []
+    if history_file.exists():
+        try:
+            history = json.loads(history_file.read_text(encoding="utf-8"))
+        except Exception:
+            history = []
+    for idx, h in enumerate(history):
+        if h.get("task_id") == task_id:
+            history[idx].update(updates)
+            break
+    try:
+        history_file.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    st.session_state.task_history = history
+
+
+def _restore_pipeline_from_task(task: Dict[str, Any]) -> bool:
+    """从历史任务恢复流水线配置、重命名模板、并行数到当前session
+
+    Returns:
+        True 表示成功恢复
+    """
+    try:
+        from processor.pipeline import Pipeline, PipelineStep
+        pipeline_dict = task.get("pipeline", {})
+        steps_data = pipeline_dict.get("steps", [])
+        steps = []
+        for sd in steps_data:
+            step = PipelineStep(step_type=sd.get("step_type", ""), params=sd.get("params", {}))
+            steps.append(step)
+        pipeline = Pipeline(name=pipeline_dict.get("name", "恢复的流水线"), steps=steps)
+        st.session_state.pipeline = pipeline
+        rt = task.get("rename_template")
+        if rt is not None:
+            st.session_state.rename_template = rt
+            st.session_state.rename_enabled = True
+        nw = task.get("num_workers")
+        if nw is not None and isinstance(nw, int) and nw > 0:
+            st.session_state.num_workers = nw
+        _invalidate_preview_cache()
+        return True
+    except Exception as e:
+        st.error(f"恢复流水线失败: {e}")
+        return False
 
 
 def _build_task_report_json(task: Dict[str, Any]) -> str:
@@ -499,13 +613,14 @@ def _render_step_params(idx: int, step, defaults: Dict[str, Any]):
 # 批量处理执行
 # ============================================================
 
-def _run_batch_processing_ui(source_paths_override=None, output_dir_override=None, is_retry=False):
+def _run_batch_processing_ui(source_paths_override=None, output_dir_override=None, is_retry=False, merge_into_task_id=None):
     """执行批量处理并在主区域显示实时进度
 
     Args:
         source_paths_override: 非None时覆盖默认路径列表（用于失败重试）
         output_dir_override: 非None时覆盖输出目录（失败重试时复用原目录）
         is_retry: 是否为重试任务
+        merge_into_task_id: 非None时处理完成后合并结果到该task_id的历史批次中
     """
     if not st.session_state.pipeline:
         st.session_state.processing = False
@@ -525,7 +640,7 @@ def _run_batch_processing_ui(source_paths_override=None, output_dir_override=Non
 
     st.header("⏳ 正在批量处理...")
     if is_retry:
-        st.info(f"本次为重试任务，共处理 {total} 张失败图片")
+        st.info(f"本次为重试任务，共处理 {total} 张失败图片，结果将合并回原批次")
     progress_bar = st.progress(0.0)
     status_text = st.empty()
     status_text.info(f"准备处理 {total} 张图片...")
@@ -605,7 +720,7 @@ def _run_batch_processing_ui(source_paths_override=None, output_dir_override=Non
     times_list = [r.processing_time for r in results if r.success and r.processing_time > 0]
 
     task_record = {
-        "task_id": str(uuid.uuid4())[:8],
+        "task_id": str(uuid.uuid4())[:8] if not merge_into_task_id else merge_into_task_id,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "input_dir": input_root_dir,
         "output_dir": output_dir,
@@ -627,18 +742,41 @@ def _run_batch_processing_ui(source_paths_override=None, output_dir_override=Non
         "is_retry": is_retry,
     }
 
-    _save_task_history(task_record)
-    st.session_state.current_task = task_record
-    st.session_state.last_results = results
+    # 生成 ZIP 并记录路径
+    if output_dir and os.path.isdir(output_dir):
+        try:
+            zip_path = os.path.join(tempfile.gettempdir(),
+                                    f"processed_{task_record['task_id']}_{int(time.time())}.zip")
+            create_zip(output_dir, zip_path)
+            task_record["zip_path"] = zip_path
+        except Exception:
+            pass
+
+    saved_task = _save_task_history(task_record, merge_into_task_id=merge_into_task_id)
+    st.session_state.current_task = saved_task
+
+    # 如果是重试合并，合并后 last_results 需要是整批结果
+    if merge_into_task_id:
+        all_results = [_dict_to_result(d) for d in saved_task.get("results", [])]
+        st.session_state.last_results = all_results
+        merged_stats = saved_task.get("stats", {})
+        st.session_state._results_total_elapsed = merged_stats.get("total_elapsed", total_elapsed)
+        st.session_state._results_metrics = {
+            "success": merged_stats.get("success", success_count),
+            "fail": merged_stats.get("fail", fail_count),
+        }
+    else:
+        st.session_state.last_results = results
+        st.session_state._results_total_elapsed = total_elapsed
+        st.session_state._results_metrics = dict(metrics)
+
     st.session_state.processing = False
     st.session_state.processing_done = True
     st.session_state._results_dir = output_dir
     st.session_state._results_start_fixed = metrics["start"]
-    st.session_state._results_total_elapsed = total_elapsed
-    st.session_state._results_metrics = dict(metrics)
-    st.session_state._current_task_id = task_record["task_id"]
-    st.session_state._zip_ready = False
-    st.session_state._zip_path = None
+    st.session_state._current_task_id = saved_task["task_id"]
+    st.session_state._zip_path = saved_task.get("zip_path")
+    st.session_state._zip_ready = bool(saved_task.get("zip_path"))
     st.rerun()
 
 
@@ -723,6 +861,7 @@ def _show_results_ui():
             if st.button("🚀 重试选中项", type="primary", disabled=len(selected_retry) == 0):
                 st.session_state._retry_paths = selected_retry
                 st.session_state._retry_output_dir = output_dir
+                st.session_state._retry_merge_task_id = st.session_state.get("_current_task_id")
                 st.session_state.processing = True
                 st.session_state.processing_done = False
                 st.rerun()
@@ -821,53 +960,244 @@ def _show_results_ui():
 
     st.divider()
 
-    # --- 任务历史 ---
-    st.subheader("📜 任务历史")
+    # --- 任务历史 / 批次中心 ---
     history = _load_task_history()
-    if not history:
-        st.caption("暂无历史记录")
-    else:
-        selected_history = st.selectbox(
-            "选择历史任务查看详情",
-            ["（不选）"] + [f"[{h['task_id']}] {h['created_at']} — {h['image_count']}张 成功{h['stats']['success']}/失败{h['stats']['fail']}"
-                          for h in history],
-            key="history_select",
-        )
-        if selected_history and selected_history != "（不选）":
-            selected_id = selected_history[1:9]
-            hist_task = next((h for h in history if h["task_id"] == selected_id), None)
-            if hist_task:
-                with st.container():
+
+    tab_history, tab_compare = st.tabs(["📜 批次中心", "📊 批次对比"])
+
+    with tab_history:
+        st.subheader("📜 批次中心")
+        if not history:
+            st.caption("暂无历史记录，处理完一批图片后这里会自动记录")
+        else:
+            history_options = [f"[{h['task_id']}] {h['created_at']} — {h['image_count']}张 ✅{h['stats']['success']}/❌{h['stats']['fail']}"
+                               for h in history]
+            selected_history = st.selectbox(
+                "选择批次查看详情",
+                ["（不选）"] + history_options,
+                key="history_select_results",
+            )
+            if selected_history and selected_history != "（不选）":
+                selected_id = selected_history[1:9]
+                hist_task = next((h for h in history if h["task_id"] == selected_id), None)
+                if hist_task:
+                    retry_note = f" · 🔄 已重试 {hist_task.get('retry_count', 0)} 次" if hist_task.get("retry_count") else ""
+                    last_retry_note = f" · 最后重试: {hist_task['last_retry_at']}" if hist_task.get("last_retry_at") else ""
                     st.markdown(f"""
-                    **任务 {hist_task['task_id']}** · {hist_task['created_at']}
-                    - 图片数: {hist_task['image_count']} · 成功: {hist_task['stats']['success']} · 失败: {hist_task['stats']['fail']}
-                    - 总耗时: {hist_task['stats']['total_elapsed']:.1f}s · 速度: {hist_task['stats'].get('avg_speed', 0):.1f}/s
-                    - 输入: `{hist_task.get('input_dir', '')}`
-                    - 输出: `{hist_task.get('output_dir', '')}`
+                    **批次 {hist_task['task_id']}** · {hist_task['created_at']}{retry_note}{last_retry_note}
+                    - 图片总数: **{hist_task['image_count']}** · ✅ 成功: **{hist_task['stats']['success']}** · ❌ 失败: **{hist_task['stats']['fail']}**
+                    - ⏱️ 总耗时: **{hist_task['stats']['total_elapsed']:.1f}s** · 🚀 速度: **{hist_task['stats'].get('avg_speed', 0):.1f}/s**
+                    - 📂 输入目录: `{hist_task.get('input_dir', '-')}`
+                    - 📂 输出目录: `{hist_task.get('output_dir', '-')}`
                     """)
+
+                    # --- 目录可用性提示 ---
+                    out_dir = hist_task.get("output_dir", "")
+                    out_exists = bool(out_dir) and os.path.isdir(out_dir)
+                    zip_path_stored = hist_task.get("zip_path", "")
+                    zip_exists = bool(zip_path_stored) and os.path.isfile(zip_path_stored)
+                    if not out_exists and not zip_exists:
+                        st.error("⚠️ 该批次的输出目录和 ZIP 文件都已被清理（可能是临时目录过期），无法直接下载输出文件，但报告和统计数据仍然完整保留。")
+                    elif not out_exists:
+                        st.warning("⚠️ 输出目录已不存在，但 ZIP 缓存可能还在，可以尝试直接下载 ZIP。")
+                    elif not zip_exists:
+                        st.info("ℹ️ ZIP 文件未缓存或已清理，但输出目录仍在，可重新打包下载。")
+
+                    # --- ZIP 下载 ---
+                    cc_zip, cc_restore = st.columns([1, 1])
+                    with cc_zip:
+                        if zip_exists:
+                            try:
+                                zip_size = os.path.getsize(zip_path_stored) / (1024 * 1024)
+                                with open(zip_path_stored, "rb") as fhz:
+                                    st.download_button(
+                                        f"📦 下载该批次 ZIP ({zip_size:.1f} MB)",
+                                        fhz,
+                                        file_name=f"batch_{hist_task['task_id']}.zip",
+                                        mime="application/zip",
+                                        use_container_width=True,
+                                        type="primary",
+                                        key=f"hist_zip_{hist_task['task_id']}",
+                                    )
+                            except Exception as e_zip:
+                                st.warning(f"ZIP 读取失败: {e_zip}")
+                        elif out_exists:
+                            if st.button("📦 重新打包 ZIP 并下载", use_container_width=True,
+                                         key=f"hist_repack_{hist_task['task_id']}"):
+                                with st.spinner("正在打包..."):
+                                    new_zip = os.path.join(
+                                        tempfile.gettempdir(),
+                                        f"batch_{hist_task['task_id']}_{int(time.time())}.zip"
+                                    )
+                                    create_zip(out_dir, new_zip)
+                                    _update_task_history_entry(hist_task["task_id"], {"zip_path": new_zip})
+                                st.success("打包完成，可重新点击下载")
+                                st.rerun()
+                        else:
+                            st.caption("📦 输出已不可下载")
+
+                    with cc_restore:
+                        if st.button("🔧 恢复该批次流水线配置", use_container_width=True,
+                                     key=f"restore_{hist_task['task_id']}"):
+                            if _restore_pipeline_from_task(hist_task):
+                                st.success("已恢复流水线步骤、重命名模板和并行数，返回首页即可使用该配置")
+
+                    # --- 失败项列表 ---
                     hist_failed = [r for r in hist_task["results"] if not r.get("success", True)]
                     if hist_failed:
                         with st.expander(f"❌ 失败项 ({len(hist_failed)})", expanded=False):
-                            for r in hist_failed[:20]:
-                                st.markdown(f"- **{Path(r.get('source_path', '')).name}**: {r.get('error_message', '')[:150]}")
+                            for r in hist_failed[:30]:
+                                st.markdown(f"- **{Path(r.get('source_path', '')).name}**: {r.get('error_message', '')[:200]}")
+                            if len(hist_failed) > 30:
+                                st.caption(f"... 还有 {len(hist_failed)-30} 条")
+
+                    # --- 耗时统计 ---
                     times_list = [r.get("processing_time", 0) for r in hist_task["results"]
                                   if r.get("success", True) and r.get("processing_time", 0) > 0]
                     if times_list:
                         st.caption(
-                            f"耗时统计: 平均 {np.mean(times_list):.2f}s · 最快 {np.min(times_list):.2f}s · "
-                            f"最慢 {np.max(times_list):.2f}s · 并行加速比 {sum(times_list)/max(0.1, hist_task['stats']['total_elapsed']):.1f}×"
+                            f"⏱️ 耗时统计: 平均 **{np.mean(times_list):.2f}s** · "
+                            f"最快 **{np.min(times_list):.2f}s** · 最慢 **{np.max(times_list):.2f}s** · "
+                            f"并行加速比 **{sum(times_list)/max(0.1, hist_task['stats']['total_elapsed']):.1f}×**"
                         )
+
+                    # --- 流水线概览 ---
+                    step_names = [s.get("step_type", "") for s in hist_task.get("pipeline", {}).get("steps", [])]
+                    st.caption(f"🔧 流水线步骤 ({len(step_names)}): {' → '.join(step_names) if step_names else '(空)'}")
+                    if hist_task.get("rename_template"):
+                        st.caption(f"✏️ 重命名模板: `{hist_task['rename_template']}` · 并行数: {hist_task.get('num_workers', '-')}")
+
+                    # --- 报告导出 ---
                     h_json = _build_task_report_json(hist_task)
                     h_csv = _build_task_report_csv(hist_task)
                     cc1, cc2 = st.columns(2)
-                    cc1.download_button("📄 导出JSON", h_json,
+                    cc1.download_button("📄 导出报告 (JSON)", h_json,
                                        file_name=f"task_{hist_task['task_id']}.json",
                                        mime="application/json", use_container_width=True,
                                        key=f"hdl_json_{hist_task['task_id']}")
-                    cc2.download_button("📊 导出CSV", h_csv,
+                    cc2.download_button("📊 导出报告 (CSV)", h_csv,
                                        file_name=f"task_{hist_task['task_id']}.csv",
                                        mime="text/csv", use_container_width=True,
                                        key=f"hdl_csv_{hist_task['task_id']}")
+
+    # --- 批次对比视图 ---
+    with tab_compare:
+        st.subheader("📊 批次对比")
+        if len(history) < 2:
+            st.info("至少需要 2 条历史批次才能对比，先处理几批图片再来吧")
+        else:
+            col_a, col_b = st.columns(2)
+            hist_opts = [f"[{h['task_id']}] {h['created_at']} · {h['image_count']}张" for h in history]
+            hist_ids = [h["task_id"] for h in history]
+            with col_a:
+                sel_a = st.selectbox("批次 A", hist_opts, index=0, key="cmp_a")
+            with col_b:
+                sel_b = st.selectbox("批次 B", hist_opts, index=min(1, len(history)-1), key="cmp_b")
+            task_a = history[hist_opts.index(sel_a)]
+            task_b = history[hist_opts.index(sel_b)]
+            if task_a["task_id"] == task_b["task_id"]:
+                st.warning("请选择两个不同的批次进行对比")
+            else:
+                def _cmp_metric(label, va, vb, unit="", higher_is_better=True):
+                    va_f = float(va) if va is not None else 0.0
+                    vb_f = float(vb) if vb is not None else 0.0
+                    delta = va_f - vb_f
+                    if abs(delta) < 1e-6:
+                        delta_str = "—"
+                    else:
+                        sign = "+" if delta > 0 else ""
+                        delta_str = f"{sign}{delta:.2f}{unit}"
+                        if higher_is_better:
+                            delta_str += " 🟢" if delta > 0 else " 🔴"
+                        else:
+                            delta_str += " 🟢" if delta < 0 else " 🔴"
+                    col1, col2, col3 = st.columns([2, 1, 1])
+                    col1.markdown(f"**{label}**")
+                    col2.markdown(f"`{va}{unit}`")
+                    col3.markdown(f"`{vb}{unit}` · {delta_str}")
+
+                # --- 基础指标 ---
+                st.markdown("#### 📈 关键指标对比")
+                st.caption("A/B 两列分别对应上方选中的两个批次，差值为 A − B")
+                _cmp_metric("图片总数", task_a["image_count"], task_b["image_count"], " 张")
+                stats_a = task_a.get("stats", {})
+                stats_b = task_b.get("stats", {})
+                ta_total = task_a["image_count"] or 1
+                tb_total = task_b["image_count"] or 1
+                sa_rate = stats_a.get("success", 0) / ta_total * 100
+                sb_rate = stats_b.get("success", 0) / tb_total * 100
+                _cmp_metric("成功率", round(sa_rate, 1), round(sb_rate, 1), "%", higher_is_better=True)
+                _cmp_metric("✅ 成功数", stats_a.get("success", 0), stats_b.get("success", 0), " 张")
+                _cmp_metric("❌ 失败数", stats_a.get("fail", 0), stats_b.get("fail", 0), " 张", higher_is_better=False)
+                _cmp_metric("⏱️ 总耗时", stats_a.get("total_elapsed", 0), stats_b.get("total_elapsed", 0), " s", higher_is_better=False)
+                _cmp_metric("🚀 平均速度", stats_a.get("avg_speed", 0), stats_b.get("avg_speed", 0), " 张/s")
+                _cmp_metric("⏱️ 单张平均耗时", stats_a.get("avg_time", 0), stats_b.get("avg_time", 0), " s", higher_is_better=False)
+
+                # --- 失败原因分布 ---
+                def _err_dist(task):
+                    from collections import Counter
+                    cnt = Counter()
+                    for r in task.get("results", []):
+                        if not r.get("success", True):
+                            msg = r.get("error_message", "未知错误")
+                            short = msg.split(":")[0][:40] if ":" in msg else msg[:40]
+                            cnt[short] += 1
+                    return dict(cnt.most_common(10))
+
+                err_a = _err_dist(task_a)
+                err_b = _err_dist(task_b)
+                if err_a or err_b:
+                    st.markdown("#### ❌ 失败原因分布 (Top 10)")
+                    all_err_keys = sorted(set(list(err_a.keys()) + list(err_b.keys())))
+                    for k in all_err_keys:
+                        ea = err_a.get(k, 0)
+                        eb = err_b.get(k, 0)
+                        _cmp_metric(k, ea, eb, " 次", higher_is_better=False)
+
+                # --- 流水线步骤配置差异 ---
+                st.markdown("#### 🔧 流水线配置差异")
+                steps_a = task_a.get("pipeline", {}).get("steps", [])
+                steps_b = task_b.get("pipeline", {}).get("steps", [])
+                max_len = max(len(steps_a), len(steps_b))
+                diff_found = False
+                for i in range(max_len):
+                    sa = steps_a[i] if i < len(steps_a) else None
+                    sb = steps_b[i] if i < len(steps_b) else None
+                    type_a = sa.get("step_type", "") if sa else "(无)"
+                    type_b = sb.get("step_type", "") if sb else "(无)"
+                    if type_a != type_b:
+                        diff_found = True
+                        col1, col2, col3 = st.columns([1, 2, 2])
+                        col1.markdown(f"**步骤 {i+1}**")
+                        col2.markdown(f"`{type_a}`")
+                        col3.markdown(f"`{type_b}`")
+                    else:
+                        # 同类型，对比参数
+                        params_a = sa.get("params", {}) if sa else {}
+                        params_b = sb.get("params", {}) if sb else {}
+                        all_keys = sorted(set(list(params_a.keys()) + list(params_b.keys())))
+                        for pk in all_keys:
+                            pa = params_a.get(pk, "(未设置)")
+                            pb = params_b.get(pk, "(未设置)")
+                            if str(pa) != str(pb):
+                                diff_found = True
+                                col1, col2, col3 = st.columns([1, 2, 2])
+                                col1.markdown(f"步骤 {i+1} · `{type_a}` · **{pk}**")
+                                col2.markdown(f"`{pa}`")
+                                col3.markdown(f"`{pb}`")
+                if not diff_found:
+                    st.success("✅ 两个批次使用了完全相同的流水线步骤和参数")
+
+                # --- 其他配置差异 ---
+                st.markdown("#### ⚙️ 其他配置")
+                _cmp_metric("并行工作数", task_a.get("num_workers", "-"), task_b.get("num_workers", "-"), "")
+                rt_a = task_a.get("rename_template") or "(未启用)"
+                rt_b = task_b.get("rename_template") or "(未启用)"
+                if rt_a != rt_b:
+                    col1, col2, col3 = st.columns([1, 2, 2])
+                    col1.markdown("**重命名模板**")
+                    col2.markdown(f"`{rt_a}`")
+                    col3.markdown(f"`{rt_b}`")
 
     st.divider()
     if st.button("🔄 开始新任务", use_container_width=True, type="secondary"):
@@ -884,6 +1214,7 @@ def _show_results_ui():
         st.session_state._current_task_id = None
         st.session_state._retry_paths = None
         st.session_state._retry_output_dir = None
+        st.session_state._retry_merge_task_id = None
         st.rerun()
 
 
@@ -917,6 +1248,7 @@ SESSION_DEFAULTS = {
     "task_history": None,
     "_retry_paths": None,
     "_retry_output_dir": None,
+    "_retry_merge_task_id": None,
 }
 
 for key, value in SESSION_DEFAULTS.items():
@@ -1053,11 +1385,17 @@ retry_output_dir = st.session_state.get("_retry_output_dir")
 # --- 正在处理: 显示进度页 ---
 if is_processing and not is_done:
     if retry_paths is not None:
+        merge_id = st.session_state.get("_retry_merge_task_id")
         _run_batch_processing_ui(
             source_paths_override=retry_paths,
             output_dir_override=retry_output_dir,
             is_retry=True,
+            merge_into_task_id=merge_id,
         )
+        # 用完清理
+        st.session_state._retry_paths = None
+        st.session_state._retry_output_dir = None
+        st.session_state._retry_merge_task_id = None
     else:
         _run_batch_processing_ui()
 
